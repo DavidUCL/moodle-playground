@@ -4,6 +4,19 @@ export const MOODLE_ROOT = "/www/moodle";
 export const ADMIN_DIRECTORY = "admin";
 export const COMPONENT_CACHE_PATH = `${MOODLE_ROOT}/.playground/core_component.php`;
 
+// Single source of truth for the MEMFS SQLite database filename/path formula.
+// Both bootstrap.js (writing the live DB) and the restoreDatabase blueprint step
+// (overwriting it from a downloaded snapshot) must agree on this exactly.
+export function buildDatabaseName(scopeId, runtimeId) {
+  const scope = String(scopeId || "default").replace(/[^A-Za-z0-9_]/gu, "_");
+  const runtime = String(runtimeId || "php").replace(/[^A-Za-z0-9_]/gu, "_");
+  return `moodle_${scope}_${runtime}`;
+}
+
+export function buildDatabaseFilePath(scopeId, runtimeId) {
+  return `${MOODLEDATA_ROOT}/${buildDatabaseName(scopeId, runtimeId)}.sq3.php`;
+}
+
 function escapePhpSingleQuoted(value) {
   return String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 }

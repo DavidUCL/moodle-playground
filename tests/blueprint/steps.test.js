@@ -5,6 +5,7 @@ import {
   getRegisteredStepNames,
   getStepHandler,
 } from "../../src/blueprint/steps/index.js";
+import { __testables as dbTestables } from "../../src/blueprint/steps/moodle-database.js";
 
 // A small but valid ZIP (shared with moodle-plugins.test.js) used to drive the
 // plugin install handler past the download/extract phase into runMoodleUpgrade
@@ -51,6 +52,7 @@ describe("step registry", () => {
       "installTheme",
       "installLanguagePack",
       "restoreCourse",
+      "restoreDatabase",
       "mkdir",
       "rmdir",
       "writeFile",
@@ -201,6 +203,183 @@ describe("unzip step handler (ZIP-slip containment)", () => {
       );
     }
     assert.ok(writes.length > 0, "expected at least one safe write");
+  });
+});
+
+describe("restoreDatabase step handler", () => {
+  const handler = getStepHandler("restoreDatabase");
+
+  const VALID_SQ3 = new Uint8Array(512).fill(0); // >100 bytes, stands in for a real .sq3
+
+  function makePhpMock() {
+    const writes = [];
+    const runs = [];
+    return {
+      writes,
+      runs,
+      php: {
+        async writeFile(path, data) {
+          writes.push({ path, data });
+        },
+        async run(code) {
+          runs.push(code);
+          return { text: '{"ok":true}' };
+        },
+      },
+    };
+  }
+
+  it("throws when url is missing", async () => {
+    await assert.rejects(() => handler({}, {}), /url.*required/i);
+  });
+
+  it("throws when url is not http(s)", async () => {
+    await assert.rejects(
+      () => handler({ url: "file:///tmp/db.sq3" }, {}),
+      /http/i,
+    );
+  });
+
+  it("throws when fetch fails", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null, { status: 404 });
+    try {
+      await assert.rejects(
+        () => handler({ url: "https://example.com/db.sq3" }, makePhpMock()),
+        /failed to fetch/i,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("throws when downloaded file is too small", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(new Uint8Array(10), { status: 200 });
+    try {
+      await assert.rejects(
+        () => handler({ url: "https://example.com/db.sq3" }, makePhpMock()),
+        /too small/i,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("writes the .sq3 to the correct MEMFS path and runs env patch", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(VALID_SQ3, { status: 200 });
+    const mock = makePhpMock();
+    try {
+      await handler(
+        { url: "https://example.com/mysite-20260630.sq3" },
+        { ...mock, scopeId: "abc", runtimeId: "php83-moodle50" },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.strictEqual(mock.writes.length, 1);
+    assert.ok(
+      mock.writes[0].path.startsWith("/persist/moodledata/moodle_abc_"),
+      `unexpected path: ${mock.writes[0].path}`,
+    );
+    assert.ok(mock.writes[0].path.endsWith(".sq3.php"));
+    assert.strictEqual(mock.runs.length, 1);
+  });
+
+  it("env patch PHP defines PLAYGROUND_SKIP_INITIALISE_CFG", () => {
+    const php = dbTestables.buildRestoreEnvPatchPhp();
+    assert.ok(php.includes("PLAYGROUND_SKIP_INITIALISE_CFG"));
+  });
+
+  it("env patch PHP updates wwwroot, dirroot, dataroot", () => {
+    const php = dbTestables.buildRestoreEnvPatchPhp();
+    assert.ok(php.includes("set_config('wwwroot'"));
+    assert.ok(php.includes("set_config('dirroot'"));
+    assert.ok(php.includes("set_config('dataroot'"));
+  });
+
+  it("env patch PHP clears allversionshash and adminsetuppending", () => {
+    const php = dbTestables.buildRestoreEnvPatchPhp();
+    assert.ok(php.includes("allversionshash"));
+    assert.ok(php.includes("adminsetuppending"));
+  });
+
+  it("env patch PHP requires config.php from the shared MOODLE_ROOT constant", () => {
+    const php = dbTestables.buildRestoreEnvPatchPhp();
+    assert.ok(php.includes("require_once('/www/moodle/config.php')"));
+  });
+
+  it("reports via publish() instead of silently continuing when php.run() throws", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(VALID_SQ3, { status: 200 });
+    const writes = [];
+    const published = [];
+    const php = {
+      async writeFile(path, data) {
+        writes.push({ path, data });
+      },
+      async run() {
+        throw new Error("simulated WASM crash");
+      },
+    };
+    try {
+      // Must NOT throw — a failure here is reported via publish(), per ADR-0005,
+      // so the rest of the blueprint can still run.
+      await handler(
+        { url: "https://example.com/db.sq3" },
+        { php, publish: (msg) => published.push(msg) },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.strictEqual(writes.length, 1, "the .sq3 write must still happen");
+    assert.ok(
+      published.some((msg) => /crashed/i.test(msg)),
+      `expected a crash message in: ${JSON.stringify(published)}`,
+    );
+  });
+
+  it("reports via publish() instead of silently continuing when php.run() returns no JSON", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(VALID_SQ3, { status: 200 });
+    const published = [];
+    const php = {
+      async writeFile() {},
+      // Simulates a PHP fatal that exits before echoing the JSON result.
+      async run() {
+        return { text: "" };
+      },
+    };
+    try {
+      await handler(
+        { url: "https://example.com/db.sq3" },
+        { php, publish: (msg) => published.push(msg) },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.ok(
+      published.some((msg) => /no parseable result/i.test(msg)),
+      `expected a no-parseable-result message in: ${JSON.stringify(published)}`,
+    );
+  });
+
+  it("still logs 'Database restored' when the env patch reports ok:true", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(VALID_SQ3, { status: 200 });
+    const published = [];
+    const mock = makePhpMock();
+    try {
+      await handler(
+        { url: "https://example.com/db.sq3" },
+        { ...mock, publish: (msg) => published.push(msg) },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.ok(published.includes("Database restored."));
   });
 });
 

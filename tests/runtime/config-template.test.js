@@ -1,12 +1,51 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  buildDatabaseFilePath,
+  buildDatabaseName,
   createMoodleConfigPhp,
   createPhpIniEntries,
   MOODLE_ROOT,
   MOODLEDATA_ROOT,
   TEMP_ROOT,
 } from "../../src/runtime/config-template.js";
+
+describe("buildDatabaseName / buildDatabaseFilePath", () => {
+  // Both bootstrap.js (writing the live DB) and the restoreDatabase blueprint
+  // step (overwriting it from a downloaded snapshot) share this formula —
+  // they must always agree on the same file for a restore to land correctly.
+
+  it("builds the expected name from scope and runtime, sanitizing hyphens too", () => {
+    // The allowlist is [A-Za-z0-9_] only — hyphens (common in real runtimeIds
+    // like "php83-moodle50") are NOT preserved, they become underscores.
+    assert.strictEqual(
+      buildDatabaseName("abc", "php83-moodle50"),
+      "moodle_abc_php83_moodle50",
+    );
+  });
+
+  it("sanitizes non-alphanumeric characters in scope and runtime", () => {
+    assert.strictEqual(
+      buildDatabaseName("scope.with.dots", "runtime/with/slashes"),
+      "moodle_scope_with_dots_runtime_with_slashes",
+    );
+  });
+
+  it("defaults scope to 'default' and runtime to 'php' when falsy", () => {
+    assert.strictEqual(
+      buildDatabaseName(undefined, undefined),
+      "moodle_default_php",
+    );
+    assert.strictEqual(buildDatabaseName("", ""), "moodle_default_php");
+  });
+
+  it("builds the full MEMFS path under MOODLEDATA_ROOT with the .sq3.php suffix", () => {
+    assert.strictEqual(
+      buildDatabaseFilePath("abc", "php83-moodle50"),
+      `${MOODLEDATA_ROOT}/moodle_abc_php83_moodle50.sq3.php`,
+    );
+  });
+});
 
 describe("createMoodleConfigPhp", () => {
   const baseParams = {

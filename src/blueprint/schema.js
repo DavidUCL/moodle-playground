@@ -31,6 +31,7 @@ const KNOWN_STEP_NAMES = new Set([
   "installTheme",
   "installLanguagePack",
   "restoreCourse",
+  "restoreDatabase",
   "mkdir",
   "rmdir",
   "writeFile",

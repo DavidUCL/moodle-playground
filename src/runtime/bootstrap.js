@@ -21,6 +21,8 @@ import {
 } from "./bootstrap-fs.js";
 import {
   ADMIN_DIRECTORY,
+  buildDatabaseFilePath,
+  buildDatabaseName,
   COMPONENT_CACHE_PATH,
   createMoodleConfigPhp,
   MOODLE_ROOT,
@@ -83,16 +85,6 @@ function buildPlaygroundProxyUrl(appBaseUrl, scopeId, runtimeId) {
   const publicBase = buildPublicBase(appBaseUrl);
   const scopedPath = `/playground/${encodeURIComponent(scopeId || "default")}/${encodeURIComponent(runtimeId || "php")}/__playground_proxy__`;
   return `${publicBase}${scopedPath}`;
-}
-
-function buildDatabaseName(scopeId, runtimeId) {
-  const scope = String(scopeId || "default").replace(/[^A-Za-z0-9_]/gu, "_");
-  const runtime = String(runtimeId || "php").replace(/[^A-Za-z0-9_]/gu, "_");
-  return `moodle_${scope}_${runtime}`;
-}
-
-function buildDatabaseFilePath(scopeId, runtimeId) {
-  return `${MOODLEDATA_ROOT}/${buildDatabaseName(scopeId, runtimeId)}.sq3.php`;
 }
 
 function buildInstallStatePath(scopeId, runtimeId) {
