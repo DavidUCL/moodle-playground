@@ -125,9 +125,9 @@ if (!defined('PLAYGROUND_ALLOW_OUTDATED_COMPONENT_CACHE')) {
 require_once('$SOURCE_DIR/lib/setup.php');
 CFGEOF
 
-USING_PREBUILT_DB=0
+# Prebuilt mode is keyed directly off PREBUILT_DB_PATH everywhere below —
+# no mirror flag to keep in sync (it is never mutated after this validation).
 if [ -n "$PREBUILT_DB_PATH" ]; then
-  USING_PREBUILT_DB=1
   # Skip the CLI installer — use the provided database file directly.
   if [ ! -f "$PREBUILT_DB_PATH" ]; then
     echo "Error: PREBUILT_DB_PATH does not exist or is not a file: $PREBUILT_DB_PATH" >&2
@@ -139,8 +139,7 @@ if [ -n "$PREBUILT_DB_PATH" ]; then
     echo "Error: Failed to copy pre-built database to $DBFILE" >&2
     exit 1
   fi
-  DBSIZE=$(wc -c < "$DBFILE" | tr -d ' ')
-  echo "Pre-built database loaded: $DBSIZE bytes" >&2
+  DBMSG="Pre-built database loaded"
 else
   echo "Running Moodle CLI install to generate snapshot..." >&2
 
@@ -176,9 +175,11 @@ else
     exit 1
   fi
 
-  DBSIZE=$(wc -c < "$DBFILE" | tr -d ' ')
-  echo "Snapshot database created: $DBSIZE bytes" >&2
+  DBMSG="Snapshot database created"
 fi
+
+DBSIZE=$(wc -c < "$DBFILE" | tr -d ' ')
+echo "$DBMSG: $DBSIZE bytes" >&2
 
 # Apply post-install defaults that the runtime installer normally does in its
 # 'finalize' stage. We run a small PHP script to set these directly.
@@ -318,7 +319,7 @@ foreach (\$classes as \$classname) {
 }
 " 2>&1 | while IFS= read -r line; do echo "[snapshot] $line" >&2; done
 
-if [ "$USING_PREBUILT_DB" = "1" ]; then
+if [ -n "$PREBUILT_DB_PATH" ]; then
   # This is a live-exported database, not a fresh install — its ad-hoc task
   # queue can contain arbitrary real work (notification emails, digests,
   # external API calls) tied to that site's actual SMTP/API credentials,
@@ -327,11 +328,15 @@ if [ "$USING_PREBUILT_DB" = "1" ]; then
   # external services as a side effect of building a preview snapshot, and a
   # large or partially-failing live queue would otherwise hard-fail this whole
   # build (see the REMAINING_TASKS check below). Clear the queue without
-  # executing it instead — the snapshot still ships with an empty queue, just
-  # without the fresh-install path's "pre-warm theme CSS from the queue"
-  # benefit for this one run.
+  # executing it instead, then run the one known-safe task the fresh path
+  # relies on (theme CSS build) directly below.
+  #
+  # Guarded like the fresh path's drain: capture the log and the PHP exit code
+  # explicitly (a pipe into `while read` would mask a fatal — e.g. config.php
+  # failing to bootstrap against the live export — and lose the diagnostics).
   echo "Using pre-built (live-exported) database — clearing pending ad-hoc tasks without executing them." >&2
-  ${PHP_BIN:-php} -d max_input_vars=5000 -r "
+  CLEAR_LOG="$TMPROOT/adhoc-clear.log"
+  if ${PHP_BIN:-php} -d max_input_vars=5000 -r "
 define('CLI_SCRIPT', true);
 define('CACHE_DISABLE_ALL', true);
 define('CACHE_DISABLE_STORES', true);
@@ -342,7 +347,43 @@ if (\$count > 0) {
     \$DB->delete_records('task_adhoc');
     echo 'Cleared ' . \$count . ' pending ad-hoc task(s) without executing them.' . PHP_EOL;
 }
-" 2>&1 | while IFS= read -r line; do echo "[snapshot] $line" >&2; done
+" >"$CLEAR_LOG" 2>&1; then
+    CLEAR_EXIT=0
+  else
+    CLEAR_EXIT=$?
+  fi
+  sed 's/^/[snapshot] /' "$CLEAR_LOG" >&2
+  if [ "$CLEAR_EXIT" -ne 0 ]; then
+    echo "Error: ad-hoc task clear exited with code $CLEAR_EXIT" >&2
+    exit 1
+  fi
+
+  # On the fresh-install path, the forced drain below executes
+  # \core\task\build_installed_themes_task from the queue — that is what
+  # pre-compiles every theme's CSS into localcache/theme with themerev values
+  # matching this very database. The queue was just cleared WITHOUT executing,
+  # so run that one task directly: it only compiles CSS (no emails, no external
+  # calls), giving live-exported snapshots the same pre-warmed-CSS guarantee as
+  # fresh installs. Without it the seed would advertise a localcache with no
+  # theme CSS, the runtime would skip its SCSS warmup, and the first page view
+  # would fall into the lazy styles.php compile that can crash the WASM runtime.
+  THEME_LOG="$TMPROOT/theme-build.log"
+  if ${PHP_BIN:-php} -d max_input_vars=5000 -r "
+define('CLI_SCRIPT', true);
+require('$SOURCE_DIR/config.php');
+\$task = new \\core\\task\\build_installed_themes_task();
+\$task->execute();
+echo 'Theme CSS built for all installed themes.' . PHP_EOL;
+" >"$THEME_LOG" 2>&1; then
+    THEME_EXIT=0
+  else
+    THEME_EXIT=$?
+  fi
+  sed 's/^/[snapshot] /' "$THEME_LOG" >&2
+  if [ "$THEME_EXIT" -ne 0 ]; then
+    echo "Error: theme CSS build exited with code $THEME_EXIT" >&2
+    exit 1
+  fi
 else
   # Drain the remaining ad-hoc task queue so the snapshot ships with an empty
   # queue and the heavy install-time work runs on the build machine instead of
@@ -399,17 +440,13 @@ if [ ! -f "$MOODLEDATA/localcache/di/CompiledContainer.php" ]; then
   echo "Error: DI container was not compiled at localcache/di/CompiledContainer.php" >&2
   exit 1
 fi
-if [ "$USING_PREBUILT_DB" != "1" ]; then
-  # Only the fresh-install path runs build_installed_themes_task (via the
-  # forced drain above), which is what populates this directory. The live-DB
-  # path intentionally skips executing the queue (see the USING_PREBUILT_DB
-  # branch above), so theme CSS isn't pre-warmed for that case — the runtime's
-  # own on-demand warmup (createThemeCssWarmupPhp() in bootstrap.js) covers it
-  # with a one-time compile cost on first view instead.
-  if [ ! -d "$MOODLEDATA/localcache/theme" ]; then
-    echo "Error: localcache/theme missing after the drain — theme CSS was not built" >&2
-    exit 1
-  fi
+# Both paths populate localcache/theme — the fresh install via the forced
+# drain (build_installed_themes_task from the queue), the prebuilt path via
+# the explicit theme build above — so the guarantee is unconditional: every
+# shipped seed carries pre-compiled theme CSS.
+if [ ! -d "$MOODLEDATA/localcache/theme" ]; then
+  echo "Error: localcache/theme missing — theme CSS was not built" >&2
+  exit 1
 fi
 
 # Pre-build the combined RequireJS bundle so the first page in the browser does
@@ -504,18 +541,12 @@ fi
 # scheme), the compiled DI container is generated PHP without filesystem paths,
 # and the RequireJS combine has its sourceMappingURL comments stripped — fail
 # loud if a build-machine path ever leaks in.
-# The live-DB path (USING_PREBUILT_DB) never populates localcache/theme (see
-# above), so exclude it from these last two steps in that case rather than
-# checking/zipping a directory that doesn't exist.
-if [ "$USING_PREBUILT_DB" = "1" ]; then
-  SEED_DIRS="di requirejs"
-else
-  SEED_DIRS="theme di requirejs"
-fi
-
-# shellcheck disable=SC2086
-if grep -R -l -e "$TMPROOT" -e "$SOURCE_DIR" \
-  $(for d in $SEED_DIRS; do printf '%s\n' "$MOODLEDATA/localcache/$d"; done) >&2; then
+# Each directory is passed as its own quoted argument (via the positional
+# parameters — $1/$2 were consumed into variables at the top) so a temp path
+# containing a space cannot word-split into nonexistent paths, which would
+# make grep error out (exit 2) and silently skip this check.
+set -- "$MOODLEDATA/localcache/theme" "$MOODLEDATA/localcache/di" "$MOODLEDATA/localcache/requirejs"
+if grep -R -l -e "$TMPROOT" -e "$SOURCE_DIR" "$@" >&2; then
   echo "Error: build-machine paths leaked into the localcache seed (files above)" >&2
   exit 1
 fi
@@ -527,8 +558,7 @@ fi
 # core_component.php (build-machine classmap paths; the runtime uses
 # .playground's cache).
 rm -f "$OUTPUT_DIR/localcache.zip"
-# shellcheck disable=SC2086
-(cd "$MOODLEDATA/localcache" && zip -qr "$OUTPUT_DIR/localcache.zip" $SEED_DIRS)
+(cd "$MOODLEDATA/localcache" && zip -qr "$OUTPUT_DIR/localcache.zip" theme di requirejs)
 SEED_SIZE=$(wc -c < "$OUTPUT_DIR/localcache.zip" | tr -d ' ')
 echo "Localcache seed written to $OUTPUT_DIR/localcache.zip ($SEED_SIZE bytes)" >&2
 

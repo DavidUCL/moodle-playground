@@ -27,6 +27,7 @@ import {
   createMoodleConfigPhp,
   MOODLE_ROOT,
   MOODLEDATA_ROOT,
+  sanitizeSegment,
   TEMP_ROOT,
 } from "./config-template.js";
 import { buildManifestState, resolveManifestUrl } from "./manifest.js";
@@ -88,8 +89,8 @@ function buildPlaygroundProxyUrl(appBaseUrl, scopeId, runtimeId) {
 }
 
 function buildInstallStatePath(scopeId, runtimeId) {
-  const scope = String(scopeId || "default").replace(/[^A-Za-z0-9_]/gu, "_");
-  const runtime = String(runtimeId || "php").replace(/[^A-Za-z0-9_]/gu, "_");
+  const scope = sanitizeSegment(scopeId, "default");
+  const runtime = sanitizeSegment(runtimeId, "php");
   return `${CONFIG_ROOT}/moodle-playground-install-${scope}-${runtime}.json`;
 }
 
@@ -2962,7 +2963,22 @@ export async function bootstrapMoodle({
   // (during the loading screen) avoids that runtime crash.
   // Skipped when the localcache seed already provided the candidate sheets
   // compiled at build time (1-3s of scssphp work saved per boot).
+  //
+  // The seed flag alone is not enough: a prebuilt-DB (live export) seed can
+  // legitimately ship without theme/ (di + requirejs only), and trusting the
+  // flag would skip the warmup with no compiled CSS anywhere — leaving the
+  // lazy styles.php SCSS compile (the crash-prone path this warmup exists to
+  // avoid) as the only way pages get styled. Verify theme CSS is actually
+  // present in the extracted seed before skipping.
+  let themeSeedPresent = false;
   if (localcacheSeeded) {
+    try {
+      themeSeedPresent = await php.isDir(`${MOODLEDATA_ROOT}/localcache/theme`);
+    } catch {
+      themeSeedPresent = false;
+    }
+  }
+  if (localcacheSeeded && themeSeedPresent) {
     publish(
       "Theme CSS pre-compiled at build time — skipping SCSS warmup.",
       0.925,
@@ -3079,6 +3095,13 @@ export async function bootstrapMoodle({
         scopeId,
         runtimeId: resolvedRuntimeId,
         onPluginInstalled,
+        // Post-restore hooks for the restoreDatabase step: re-run the boot-time
+        // config normalizer and theme CSS warmup against a freshly restored
+        // database, so it gets the same defaults/allversionshash treatment and
+        // compiled theme CSS as the boot database did. See
+        // src/blueprint/steps/moodle-database.js and ADR-0017.
+        runConfigNormalizer: () => runConfigNormalizer(php, webRoot),
+        runThemeCssWarmup: () => runThemeCssWarmup(php, webRoot),
       });
       if (result.landingPage) {
         blueprintLandingPage = result.landingPage;
