@@ -2973,7 +2973,8 @@ export async function bootstrapMoodle({
   let themeSeedPresent = false;
   if (localcacheSeeded) {
     try {
-      themeSeedPresent = await php.isDir(`${MOODLEDATA_ROOT}/localcache/theme`);
+      const about = await php.analyzePath(`${MOODLEDATA_ROOT}/localcache/theme`);
+      themeSeedPresent = Boolean(about?.exists && about.object?.isFolder);
     } catch {
       themeSeedPresent = false;
     }
