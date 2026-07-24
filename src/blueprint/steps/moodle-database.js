@@ -261,6 +261,9 @@ ob_start();
 $result = ['ok' => false];
 try {
     require_once('${MOODLE_ROOT}/config.php');
+    // setup.php only loads filelib (download_file_content) behind a proxy-config
+    // conditional, so a bare config.php require does not provide it.
+    require_once($CFG->libdir . '/filelib.php');
 
     $tmp = '${RESTORE_TMP_PATH}';
     @unlink($tmp);

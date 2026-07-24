@@ -262,6 +262,9 @@ describe("restoreDatabase step handler", () => {
     assert.ok(php.includes("SQLite format 3"));
     assert.ok(php.includes(dbTestables.RESTORE_TMP_PATH));
     assert.ok(php.includes("require_once('/www/moodle/config.php')"));
+    // setup.php only loads filelib behind a proxy-config conditional, so the
+    // script must require it itself or download_file_content() is undefined.
+    assert.ok(php.includes("require_once($CFG->libdir . '/filelib.php')"));
   });
 
   it("swap PHP renames the snapshot into place BEFORE loading config.php", () => {
