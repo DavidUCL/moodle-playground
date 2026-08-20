@@ -12,16 +12,13 @@
  */
 
 import { phpRestoreCourse } from "../php/helpers.js";
+import { isHttpUrl, trimmedString } from "./step-utils.js";
 
 // Per-session counter for unique temp paths when restoring from embedded data.
 let embeddedRestoreCounter = 0;
 
 export function registerMoodleRestoreSteps(register) {
   register("restoreCourse", handleRestoreCourse);
-}
-
-function trimmedString(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 async function handleRestoreCourse(step, context) {
@@ -37,7 +34,7 @@ async function handleRestoreCourse(step, context) {
       "restoreCourse: one of 'url', 'path', or 'data' is required.",
     );
   }
-  if (url && !/^https?:\/\//iu.test(url)) {
+  if (url && !isHttpUrl(url)) {
     throw new Error("restoreCourse: 'url' must be an http(s) URL.");
   }
 

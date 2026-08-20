@@ -5,6 +5,7 @@ import {
   getRegisteredStepNames,
   getStepHandler,
 } from "../../src/blueprint/steps/index.js";
+import { __testables as dbTestables } from "../../src/blueprint/steps/moodle-database.js";
 
 // A small but valid ZIP (shared with moodle-plugins.test.js) used to drive the
 // plugin install handler past the download/extract phase into runMoodleUpgrade
@@ -51,6 +52,7 @@ describe("step registry", () => {
       "installTheme",
       "installLanguagePack",
       "restoreCourse",
+      "restoreDatabase",
       "mkdir",
       "rmdir",
       "writeFile",
@@ -201,6 +203,219 @@ describe("unzip step handler (ZIP-slip containment)", () => {
       );
     }
     assert.ok(writes.length > 0, "expected at least one safe write");
+  });
+});
+
+describe("restoreDatabase step handler", () => {
+  const handler = getStepHandler("restoreDatabase");
+
+  const DOWNLOAD_OK = JSON.stringify({ ok: true, bytes: 4096 });
+  const PATCH_OK = JSON.stringify({ ok: true, swapped: true });
+
+  // php.run mock that replies with queued texts (or throws queued Errors) in
+  // call order and records every script it was given.
+  function makePhpMock(results = [DOWNLOAD_OK, PATCH_OK]) {
+    const runs = [];
+    const queue = [...results];
+    return {
+      runs,
+      php: {
+        async run(code) {
+          runs.push(code);
+          const next = queue.length ? queue.shift() : '{"ok":true}';
+          if (next instanceof Error) {
+            throw next;
+          }
+          return { text: next };
+        },
+      },
+    };
+  }
+
+  it("throws when url is missing", async () => {
+    await assert.rejects(() => handler({}, {}), /url.*required/i);
+  });
+
+  it("throws when url is not http(s)", async () => {
+    await assert.rejects(
+      () => handler({ url: "file:///tmp/db.sq3" }, {}),
+      /http/i,
+    );
+  });
+
+  it("throws when the download script reports failure (live DB untouched)", async () => {
+    const mock = makePhpMock([
+      JSON.stringify({ ok: false, error: { message: "HTTP 404" } }),
+    ]);
+    await assert.rejects(
+      () => handler({ url: "https://example.com/db.sq3" }, { php: mock.php }),
+      /HTTP 404/,
+    );
+    assert.strictEqual(mock.runs.length, 1, "must never reach the swap");
+  });
+
+  it("download PHP streams inside PHP and validates the SQLite magic header", () => {
+    const php = dbTestables.buildRestoreDownloadPhp(
+      "https://example.com/db.sq3",
+    );
+    assert.ok(php.includes("download_file_content("));
+    assert.ok(php.includes("SQLite format 3"));
+    assert.ok(php.includes(dbTestables.RESTORE_TMP_PATH));
+    assert.ok(php.includes("require_once('/www/moodle/config.php')"));
+    // setup.php only loads filelib behind a proxy-config conditional, so the
+    // script must require it itself or download_file_content() is undefined.
+    assert.ok(php.includes("require_once($CFG->libdir . '/filelib.php')"));
+  });
+
+  it("swap PHP renames the snapshot into place BEFORE loading config.php", () => {
+    const php = dbTestables.buildRestoreSwapAndPatchPhp(
+      "/persist/moodledata/moodle_a_b.sq3.php",
+    );
+    const renameAt = php.indexOf("rename(");
+    const configAt = php.indexOf("require_once('/www/moodle/config.php')");
+    assert.ok(renameAt >= 0, "expected a rename call");
+    assert.ok(configAt >= 0, "expected the config.php require");
+    assert.ok(renameAt < configAt, "rename must precede config.php load");
+    assert.ok(php.includes("PLAYGROUND_SKIP_INITIALISE_CFG"));
+  });
+
+  it("swap PHP updates wwwroot, dirroot, dataroot and adminsetuppending", () => {
+    const php = dbTestables.buildRestoreSwapAndPatchPhp("/x.sq3.php");
+    assert.ok(php.includes("set_config('wwwroot'"));
+    assert.ok(php.includes("set_config('dirroot'"));
+    assert.ok(php.includes("set_config('dataroot'"));
+    assert.ok(php.includes("adminsetuppending"));
+  });
+
+  it("swap PHP seeds allversionshash to the CURRENT code hash, never blank", () => {
+    const php = dbTestables.buildRestoreSwapAndPatchPhp("/x.sq3.php");
+    assert.ok(php.includes("core_component::get_all_versions_hash()"));
+    assert.ok(
+      !php.includes("set_config('allversionshash', '')"),
+      "a blank hash FORCES upgrade detection (see moodle-plugins.js)",
+    );
+  });
+
+  it("targets the shared MEMFS db path formula in the swap script", async () => {
+    const mock = makePhpMock();
+    await handler(
+      { url: "https://example.com/mysite-20260630.sq3" },
+      { php: mock.php, scopeId: "abc", runtimeId: "php83-moodle50" },
+    );
+    assert.strictEqual(mock.runs.length, 2);
+    assert.ok(
+      mock.runs[1].includes(
+        "/persist/moodledata/moodle_abc_php83_moodle50.sq3.php",
+      ),
+      `unexpected swap script: ${mock.runs[1].slice(0, 400)}`,
+    );
+  });
+
+  it("throws when the swap failed before touching the live database", async () => {
+    const mock = makePhpMock([
+      DOWNLOAD_OK,
+      JSON.stringify({
+        ok: false,
+        swapped: false,
+        error: { message: "rename failed" },
+      }),
+    ]);
+    await assert.rejects(
+      () => handler({ url: "https://example.com/db.sq3" }, { php: mock.php }),
+      /rename failed/,
+    );
+  });
+
+  it("reports failure and does NOT publish success when the env patch fails after the swap", async () => {
+    const mock = makePhpMock([
+      DOWNLOAD_OK,
+      JSON.stringify({
+        ok: false,
+        swapped: true,
+        error: { message: "set_config exploded" },
+      }),
+    ]);
+    const published = [];
+    // Must NOT throw — the swap already happened and aborting cannot undo it.
+    await handler(
+      { url: "https://example.com/db.sq3" },
+      { php: mock.php, publish: (msg) => published.push(msg) },
+    );
+    assert.ok(
+      published.some((msg) => /environment patch failed/i.test(msg)),
+      `expected a patch-failure message in: ${JSON.stringify(published)}`,
+    );
+    assert.ok(!published.includes("Database restored."));
+  });
+
+  it("reports via publish() instead of silently continuing when php.run() crashes on the patch", async () => {
+    const mock = makePhpMock([DOWNLOAD_OK, new Error("simulated WASM crash")]);
+    const published = [];
+    await handler(
+      { url: "https://example.com/db.sq3" },
+      { php: mock.php, publish: (msg) => published.push(msg) },
+    );
+    assert.ok(
+      published.some((msg) => /crashed/i.test(msg)),
+      `expected a crash message in: ${JSON.stringify(published)}`,
+    );
+    assert.ok(!published.includes("Database restored."));
+  });
+
+  it("reports via publish() when the patch returns no JSON", async () => {
+    // Simulates a PHP fatal that exits before echoing the JSON result.
+    const mock = makePhpMock([DOWNLOAD_OK, ""]);
+    const published = [];
+    await handler(
+      { url: "https://example.com/db.sq3" },
+      { php: mock.php, publish: (msg) => published.push(msg) },
+    );
+    assert.ok(
+      published.some((msg) => /no parseable result/i.test(msg)),
+      `expected a no-parseable-result message in: ${JSON.stringify(published)}`,
+    );
+    assert.ok(!published.includes("Database restored."));
+  });
+
+  it("publishes success and re-runs the normalizer + theme warmup via context hooks", async () => {
+    // download, swap, cache purge
+    const mock = makePhpMock([DOWNLOAD_OK, PATCH_OK, '{"ok":true}']);
+    const published = [];
+    let normalized = 0;
+    let warmed = 0;
+    await handler(
+      { url: "https://example.com/db.sq3" },
+      {
+        php: mock.php,
+        publish: (msg) => published.push(msg),
+        runConfigNormalizer: async () => {
+          normalized += 1;
+          return { ok: true };
+        },
+        runThemeCssWarmup: async () => {
+          warmed += 1;
+          return { ok: true };
+        },
+      },
+    );
+    assert.strictEqual(normalized, 1);
+    assert.strictEqual(warmed, 1);
+    assert.strictEqual(mock.runs.length, 3, "download + swap + cache purge");
+    assert.ok(mock.runs[2].includes("purge_all_caches"));
+    assert.ok(published.includes("Database restored."));
+  });
+
+  it("skips the cache purge when the normalizer hook is unavailable", async () => {
+    // phpPurgeMoodleCaches() blanks allversionshash; only the normalizer
+    // re-seeds it, so without the hook the purge must not run.
+    const mock = makePhpMock();
+    const published = [];
+    await handler(
+      { url: "https://example.com/db.sq3" },
+      { php: mock.php, publish: (msg) => published.push(msg) },
+    );
+    assert.strictEqual(mock.runs.length, 2, "download + swap only, no purge");
+    assert.ok(published.includes("Database restored."));
   });
 });
 

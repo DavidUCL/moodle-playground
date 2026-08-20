@@ -4,6 +4,7 @@ import { registerMoodleCohortSteps } from "./moodle-cohorts.js";
 import { registerMoodleConfigSteps } from "./moodle-config.js";
 import { registerMoodleConfigFileSteps } from "./moodle-config-files.js";
 import { registerMoodleCourseSteps } from "./moodle-courses.js";
+import { registerMoodleDatabaseSteps } from "./moodle-database.js";
 import { registerMoodleEnrolSteps } from "./moodle-enrol.js";
 import { registerMoodleInstallSteps } from "./moodle-install.js";
 import { registerMoodleLanguageSteps } from "./moodle-language.js";
@@ -33,6 +34,7 @@ export function getRegisteredStepNames() {
 
 // Register all built-in steps
 registerFilesystemSteps(registerStep);
+registerMoodleDatabaseSteps(registerStep);
 registerRequestSteps(registerStep);
 registerMoodleInstallSteps(registerStep);
 registerMoodleConfigSteps(registerStep);

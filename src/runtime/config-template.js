@@ -4,6 +4,27 @@ export const MOODLE_ROOT = "/www/moodle";
 export const ADMIN_DIRECTORY = "admin";
 export const COMPONENT_CACHE_PATH = `${MOODLE_ROOT}/.playground/core_component.php`;
 
+// Single source of truth for turning a scope/runtime id into a filesystem-safe
+// path segment. Everything that derives per-scope file names (the database
+// path below, bootstrap.js's install-state marker) must use this same
+// transformation, or the DB file and its markers end up keyed differently.
+export function sanitizeSegment(value, fallback) {
+  return String(value || fallback).replace(/[^A-Za-z0-9_]/gu, "_");
+}
+
+// Single source of truth for the MEMFS SQLite database filename/path formula.
+// Both bootstrap.js (writing the live DB) and the restoreDatabase blueprint step
+// (overwriting it from a downloaded snapshot) must agree on this exactly.
+export function buildDatabaseName(scopeId, runtimeId) {
+  const scope = sanitizeSegment(scopeId, "default");
+  const runtime = sanitizeSegment(runtimeId, "php");
+  return `moodle_${scope}_${runtime}`;
+}
+
+export function buildDatabaseFilePath(scopeId, runtimeId) {
+  return `${MOODLEDATA_ROOT}/${buildDatabaseName(scopeId, runtimeId)}.sq3.php`;
+}
+
 function escapePhpSingleQuoted(value) {
   return String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 }

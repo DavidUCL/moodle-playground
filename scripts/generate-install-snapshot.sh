@@ -19,6 +19,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SOURCE_DIR=${1:-}
 OUTPUT_DIR=${2:-}
+# When set, skip the CLI installer and use this pre-built SQLite file instead.
+PREBUILT_DB_PATH=${PREBUILT_DB_PATH:-}
 
 if [ -z "$SOURCE_DIR" ] || [ ! -d "$SOURCE_DIR" ]; then
   echo "Usage: $0 <moodle-source-dir> <output-dir>" >&2
@@ -123,42 +125,61 @@ if (!defined('PLAYGROUND_ALLOW_OUTDATED_COMPONENT_CACHE')) {
 require_once('$SOURCE_DIR/lib/setup.php');
 CFGEOF
 
-echo "Running Moodle CLI install to generate snapshot..." >&2
-
-# Run the Moodle CLI installer.
-# Guard the invocation so `set -e` does not abort before we can dump the log:
-# a non-zero installer exit must surface the captured output and a clear error,
-# otherwise the caller (build-moodle-bundle.sh) would treat it as non-fatal and
-# ship a snapshot-less bundle with the installer error lost.
-INSTALL_LOG="$TMPROOT/install.log"
-if ${PHP_BIN:-php} -d max_input_vars=5000 "$SOURCE_DIR/admin/cli/install_database.php" \
-  --agree-license \
-  --adminuser=admin \
-  --adminpass=password \
-  --adminemail=admin@example.com \
-  --fullname="Moodle Playground" \
-  --shortname="Playground" \
-  >"$INSTALL_LOG" 2>&1; then
-  INSTALL_EXIT=0
+# Prebuilt mode is keyed directly off PREBUILT_DB_PATH everywhere below —
+# no mirror flag to keep in sync (it is never mutated after this validation).
+if [ -n "$PREBUILT_DB_PATH" ]; then
+  # Skip the CLI installer — use the provided database file directly.
+  if [ ! -f "$PREBUILT_DB_PATH" ]; then
+    echo "Error: PREBUILT_DB_PATH does not exist or is not a file: $PREBUILT_DB_PATH" >&2
+    exit 1
+  fi
+  echo "Using pre-built database: $PREBUILT_DB_PATH" >&2
+  cp "$PREBUILT_DB_PATH" "$DBFILE"
+  if [ ! -f "$DBFILE" ]; then
+    echo "Error: Failed to copy pre-built database to $DBFILE" >&2
+    exit 1
+  fi
+  DBMSG="Pre-built database loaded"
 else
-  INSTALL_EXIT=$?
-fi
+  echo "Running Moodle CLI install to generate snapshot..." >&2
 
-# Show output prefixed for readability (always, including on failure)
-sed 's/^/[snapshot] /' "$INSTALL_LOG" >&2
+  # Run the Moodle CLI installer.
+  # Guard the invocation so `set -e` does not abort before we can dump the log:
+  # a non-zero installer exit must surface the captured output and a clear error,
+  # otherwise the caller (build-moodle-bundle.sh) would treat it as non-fatal and
+  # ship a snapshot-less bundle with the installer error lost.
+  INSTALL_LOG="$TMPROOT/install.log"
+  if ${PHP_BIN:-php} -d max_input_vars=5000 "$SOURCE_DIR/admin/cli/install_database.php" \
+    --agree-license \
+    --adminuser=admin \
+    --adminpass=password \
+    --adminemail=admin@example.com \
+    --fullname="Moodle Playground" \
+    --shortname="Playground" \
+    >"$INSTALL_LOG" 2>&1; then
+    INSTALL_EXIT=0
+  else
+    INSTALL_EXIT=$?
+  fi
 
-if [ "$INSTALL_EXIT" -ne 0 ]; then
-  echo "Error: Moodle CLI installer exited with code $INSTALL_EXIT" >&2
-  exit 1
-fi
+  # Show output prefixed for readability (always, including on failure)
+  sed 's/^/[snapshot] /' "$INSTALL_LOG" >&2
 
-if [ ! -f "$DBFILE" ]; then
-  echo "Error: Database file was not created at $DBFILE" >&2
-  exit 1
+  if [ "$INSTALL_EXIT" -ne 0 ]; then
+    echo "Error: Moodle CLI installer exited with code $INSTALL_EXIT" >&2
+    exit 1
+  fi
+
+  if [ ! -f "$DBFILE" ]; then
+    echo "Error: Database file was not created at $DBFILE" >&2
+    exit 1
+  fi
+
+  DBMSG="Snapshot database created"
 fi
 
 DBSIZE=$(wc -c < "$DBFILE" | tr -d ' ')
-echo "Snapshot database created: $DBSIZE bytes" >&2
+echo "$DBMSG: $DBSIZE bytes" >&2
 
 # Apply post-install defaults that the runtime installer normally does in its
 # 'finalize' stage. We run a small PHP script to set these directly.
@@ -298,25 +319,96 @@ foreach (\$classes as \$classname) {
 }
 " 2>&1 | while IFS= read -r line; do echo "[snapshot] $line" >&2; done
 
-# Drain the remaining ad-hoc task queue so the snapshot ships with an empty
-# queue and the heavy install-time work runs on the build machine instead of
-# in the browser. Most importantly \core\task\build_installed_themes_task
-# compiles every theme's CSS into $MOODLEDATA/localcache/theme/... with the
-# matching themerev/themesubrev values written to this very database.
-# (The qbank transfer tasks above are deleted BEFORE this so they never run.)
-# --force only bypasses the cron_enabled config check; --ignorelimits skips
-# the adhoc concurrency/runtime limits.
-DRAIN_LOG="$TMPROOT/adhoc-drain.log"
-if ${PHP_BIN:-php} -d max_input_vars=5000 "$SOURCE_DIR/admin/cli/adhoc_task.php" \
-  --execute --force --ignorelimits >"$DRAIN_LOG" 2>&1; then
-  DRAIN_EXIT=0
+if [ -n "$PREBUILT_DB_PATH" ]; then
+  # This is a live-exported database, not a fresh install — its ad-hoc task
+  # queue can contain arbitrary real work (notification emails, digests,
+  # external API calls) tied to that site's actual SMTP/API credentials,
+  # which are still present in the copied mdl_config. Force-executing it here
+  # (as the fresh-install path below does) could send real emails or hit real
+  # external services as a side effect of building a preview snapshot, and a
+  # large or partially-failing live queue would otherwise hard-fail this whole
+  # build (see the REMAINING_TASKS check below). Clear the queue without
+  # executing it instead, then run the one known-safe task the fresh path
+  # relies on (theme CSS build) directly below.
+  #
+  # Guarded like the fresh path's drain: capture the log and the PHP exit code
+  # explicitly (a pipe into `while read` would mask a fatal — e.g. config.php
+  # failing to bootstrap against the live export — and lose the diagnostics).
+  echo "Using pre-built (live-exported) database — clearing pending ad-hoc tasks without executing them." >&2
+  CLEAR_LOG="$TMPROOT/adhoc-clear.log"
+  if ${PHP_BIN:-php} -d max_input_vars=5000 -r "
+define('CLI_SCRIPT', true);
+define('CACHE_DISABLE_ALL', true);
+define('CACHE_DISABLE_STORES', true);
+require('$SOURCE_DIR/config.php');
+global \$DB;
+\$count = \$DB->count_records('task_adhoc');
+if (\$count > 0) {
+    \$DB->delete_records('task_adhoc');
+    echo 'Cleared ' . \$count . ' pending ad-hoc task(s) without executing them.' . PHP_EOL;
+}
+" >"$CLEAR_LOG" 2>&1; then
+    CLEAR_EXIT=0
+  else
+    CLEAR_EXIT=$?
+  fi
+  sed 's/^/[snapshot] /' "$CLEAR_LOG" >&2
+  if [ "$CLEAR_EXIT" -ne 0 ]; then
+    echo "Error: ad-hoc task clear exited with code $CLEAR_EXIT" >&2
+    exit 1
+  fi
+
+  # On the fresh-install path, the forced drain below executes
+  # \core\task\build_installed_themes_task from the queue — that is what
+  # pre-compiles every theme's CSS into localcache/theme with themerev values
+  # matching this very database. The queue was just cleared WITHOUT executing,
+  # so run that one task directly: it only compiles CSS (no emails, no external
+  # calls), giving live-exported snapshots the same pre-warmed-CSS guarantee as
+  # fresh installs. Without it the seed would advertise a localcache with no
+  # theme CSS, the runtime would skip its SCSS warmup, and the first page view
+  # would fall into the lazy styles.php compile that can crash the WASM runtime.
+  THEME_LOG="$TMPROOT/theme-build.log"
+  if ${PHP_BIN:-php} -d max_input_vars=5000 -r "
+define('CLI_SCRIPT', true);
+require('$SOURCE_DIR/config.php');
+\$task = new \\core\\task\\build_installed_themes_task();
+\$task->execute();
+echo 'Theme CSS built for all installed themes.' . PHP_EOL;
+" >"$THEME_LOG" 2>&1; then
+    THEME_EXIT=0
+  else
+    THEME_EXIT=$?
+  fi
+  sed 's/^/[snapshot] /' "$THEME_LOG" >&2
+  if [ "$THEME_EXIT" -ne 0 ]; then
+    echo "Error: theme CSS build exited with code $THEME_EXIT" >&2
+    exit 1
+  fi
 else
-  DRAIN_EXIT=$?
-fi
-sed 's/^/[snapshot] /' "$DRAIN_LOG" >&2
-if [ "$DRAIN_EXIT" -ne 0 ]; then
-  echo "Error: adhoc task drain exited with code $DRAIN_EXIT" >&2
-  exit 1
+  # Drain the remaining ad-hoc task queue so the snapshot ships with an empty
+  # queue and the heavy install-time work runs on the build machine instead of
+  # in the browser. Most importantly \core\task\build_installed_themes_task
+  # compiles every theme's CSS into $MOODLEDATA/localcache/theme/... with the
+  # matching themerev/themesubrev values written to this very database.
+  # (The qbank transfer tasks above are deleted BEFORE this so they never run.)
+  # --force only bypasses the cron_enabled config check; --ignorelimits skips
+  # the adhoc concurrency/runtime limits.
+  #
+  # Only safe for a fresh CLI install, where the queue holds a handful of known
+  # install-time tasks — see the USING_PREBUILT_DB branch above for why a
+  # live-exported database must NOT go through this path.
+  DRAIN_LOG="$TMPROOT/adhoc-drain.log"
+  if ${PHP_BIN:-php} -d max_input_vars=5000 "$SOURCE_DIR/admin/cli/adhoc_task.php" \
+    --execute --force --ignorelimits >"$DRAIN_LOG" 2>&1; then
+    DRAIN_EXIT=0
+  else
+    DRAIN_EXIT=$?
+  fi
+  sed 's/^/[snapshot] /' "$DRAIN_LOG" >&2
+  if [ "$DRAIN_EXIT" -ne 0 ]; then
+    echo "Error: adhoc task drain exited with code $DRAIN_EXIT" >&2
+    exit 1
+  fi
 fi
 
 # The drain must leave the queue empty: adhoc_task.php exits 0 even when a
@@ -348,8 +440,12 @@ if [ ! -f "$MOODLEDATA/localcache/di/CompiledContainer.php" ]; then
   echo "Error: DI container was not compiled at localcache/di/CompiledContainer.php" >&2
   exit 1
 fi
+# Both paths populate localcache/theme — the fresh install via the forced
+# drain (build_installed_themes_task from the queue), the prebuilt path via
+# the explicit theme build above — so the guarantee is unconditional: every
+# shipped seed carries pre-compiled theme CSS.
 if [ ! -d "$MOODLEDATA/localcache/theme" ]; then
-  echo "Error: localcache/theme missing after the drain — theme CSS was not built" >&2
+  echo "Error: localcache/theme missing — theme CSS was not built" >&2
   exit 1
 fi
 
@@ -445,9 +541,12 @@ fi
 # scheme), the compiled DI container is generated PHP without filesystem paths,
 # and the RequireJS combine has its sourceMappingURL comments stripped — fail
 # loud if a build-machine path ever leaks in.
-if grep -R -l -e "$TMPROOT" -e "$SOURCE_DIR" \
-  "$MOODLEDATA/localcache/theme" "$MOODLEDATA/localcache/di" \
-  "$MOODLEDATA/localcache/requirejs" >&2; then
+# Each directory is passed as its own quoted argument (via the positional
+# parameters — $1/$2 were consumed into variables at the top) so a temp path
+# containing a space cannot word-split into nonexistent paths, which would
+# make grep error out (exit 2) and silently skip this check.
+set -- "$MOODLEDATA/localcache/theme" "$MOODLEDATA/localcache/di" "$MOODLEDATA/localcache/requirejs"
+if grep -R -l -e "$TMPROOT" -e "$SOURCE_DIR" "$@" >&2; then
   echo "Error: build-machine paths leaked into the localcache seed (files above)" >&2
   exit 1
 fi
